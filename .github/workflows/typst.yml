@@ -1,0 +1,138 @@
+name: Compile Typst
+
+# Compiles every .typ file changed by a push and publishes each PDF as a
+# downloadable (un-zipped) workflow artifact. If the branch has an open pull
+# request, a comment with direct download links is posted on it. Links are
+# always written to the run's summary page as well.
+
+on:
+  push:
+    branches: ['**']
+    paths: ['**.typ']
+  # A PR opened after its branch was pushed would otherwise never get a comment.
+  pull_request:
+    types: [opened, reopened]
+    paths: ['**.typ']
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Find changed .typ files
+    if: github.event.deleted != true
+    runs-on: ubuntu-latest
+    outputs:
+      files: ${{ steps.changed.outputs.files }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            # Everything the PR changes
+            base=$(git merge-base "$PR_BASE" HEAD)
+          elif [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            # New branch, or the previous tip is gone (force-push):
+            # compare against the default branch, or take everything on the first push.
+            if [ "$REF_NAME" != "$DEFAULT_BRANCH" ] && git rev-parse -q --verify "origin/$DEFAULT_BRANCH" >/dev/null; then
+              base=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)
+            else
+              base=$(git hash-object -t tree /dev/null)
+            fi
+          else
+            # Regular push: only what this push changed
+            base=$BEFORE
+          fi
+          # Deleted files are skipped. PDF names are the repo path with "/" -> "__",
+          # so e.g. a/main.typ and b/main.typ don't collide.
+          files=$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.typ' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))
+                | map({src: ., pdf: ((sub("\\.typ$"; "") | gsub("/"; "__")) + ".pdf")})')
+          echo "Changed: $files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+  compile:
+    name: Compile ${{ matrix.src }}
+    needs: detect
+    if: needs.detect.outputs.files != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.files) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: typst-community/setup-typst@v5
+
+      - name: Compile
+        env:
+          SRC: ${{ matrix.src }}
+          PDF: ${{ matrix.pdf }}
+        run: |
+          mkdir -p out
+          typst compile --root . "$SRC" "out/$PDF"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: out/${{ matrix.pdf }}
+          # Upload the PDF itself instead of a zip; the artifact is named after the file.
+          archive: false
+          if-no-files-found: error
+
+  report:
+    name: Post PDF links
+    needs: [detect, compile]
+    if: always() && needs.detect.result == 'success' && needs.detect.outputs.files != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          FILES: ${{ needs.detect.outputs.files }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # {"<artifact name>": <id>, ...} for this run
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            --jq '.artifacts[] | {(.name): .id}' | jq -s 'add // {}')
+
+          body=$(jq -r --argjson a "$artifacts" --arg run "$run_url" --arg sha "${SHA:0:7}" '
+            "### 📄 Typst PDFs for \($sha)\n\n| Source | PDF |\n|---|---|\n"
+            + (map("| `\(.src)` | "
+                + (if $a[.pdf] then "[\(.pdf)](\($run)/artifacts/\($a[.pdf]))"
+                   else "❌ failed to compile — see [the run](\($run))" end)
+                + " |") | join("\n"))
+            + "\n\n<sub>Links expire with the workflow artifacts (90 days by default).</sub>"
+          ' <<<"$FILES")
+
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+              --json number --jq '.[0].number // empty')
+          fi
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            echo "No open PR for $BRANCH; links are on the run summary page."
+          fi
