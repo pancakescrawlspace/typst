@@ -132,7 +132,16 @@ jobs:
               --json number --jq '.[0].number // empty')
           fi
           if [ -n "$PR_NUMBER" ]; then
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body"
+            # The push run and the PR-opened run can both reach this point for the
+            # same commit (PR opened while the push run was in flight): post once per SHA.
+            marker="<!-- typst-pdf:$SHA -->"
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"$marker\")) | .id")
+            if [ -n "$existing" ]; then
+              echo "PR #$PR_NUMBER already has PDF links for $SHA; not commenting again."
+            else
+              gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$marker"$'\n'"$body"
+            fi
           else
             echo "No open PR for $BRANCH; links are on the run summary page."
           fi
